@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# sedna-run
+# Thin wrapper for the canonical scripts/run_sedna.sh pipeline.
+#
+# Works in both:
+#   1) source tree:
+#        repo/bin/sedna-run
+#        repo/scripts/run_sedna.sh
+#
+#   2) conda installation:
+#        $PREFIX/bin/sedna-run
+#        $PREFIX/share/sedna/scripts/run_sedna.sh
+
+SELF="$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")"
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+CANDIDATES=(
+    "$BIN_DIR/../scripts/run_sedna.sh"
+    "$BIN_DIR/../share/sedna/scripts/run_sedna.sh"
+)
+
+for SCRIPT in "${CANDIDATES[@]}"; do
+    if [[ -f "$SCRIPT" ]]; then
+        exec bash "$SCRIPT" "$@"
+    fi
+done
+
+echo "ERROR: cannot find run_sedna.sh" >&2
+echo "Tried:" >&2
+for SCRIPT in "${CANDIDATES[@]}"; do
+    echo "  $SCRIPT" >&2
+done
+exit 1

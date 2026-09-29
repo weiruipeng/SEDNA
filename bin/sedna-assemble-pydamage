@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+############################################################
+# sedna-assemble-pydamage
+#
+# de novo assembly (MEGAHIT) + BWA-MEM mapping + pydamage analysis.
+# Overwrites any existing output directory by default.
+############################################################
+
+usage() {
+cat <<'USAGE'
+Usage:
+  sedna assemble-pydamage <R1.fastq[.gz]> <R2.fastq[.gz]|-> <sample_name> <threads>
+
+Single-end example:
+  sedna assemble-pydamage XD_S_136_lt100bp.fastq - sample136 16
+
+Paired-end example:
+  sedna assemble-pydamage sample_R1.fastq.gz sample_R2.fastq.gz sample136 16
+
+The output directory is <sample_name>.work. If it already exists it will be
+DELETED and rebuilt; the assembly subdirectory cannot be reused because
+MEGAHIT requires its -o target to not pre-exist.
+USAGE
+}
+
+if [[ $# -lt 1 ]]; then usage; exit 1; fi
+case "$1" in -h|--help|help) usage; exit 0 ;; esac
+
+if [[ $# -ne 4 ]]; then
+    usage
+    exit 1
+fi
+
+R1="$1"
+R2="$2"
+SAMPLE="$3"
+THREADS="$4"
+
+OUTDIR="${SAMPLE}.work"
+ASM_DIR="${OUTDIR}/assembly"
+MAP_DIR="${OUTDIR}/mapping"
+PD_DIR="${OUTDIR}/pydamage"
+
+if [[ ! -s "$R1" ]]; then
+    echo "ERROR: R1 missing or empty: $R1" >&2
+    exit 1
+fi
+if [[ "$R2" != "-" && ! -s "$R2" ]]; then
+    echo "ERROR: R2 missing or empty: $R2" >&2
+    exit 1
+fi
+
+if [[ -d "$OUTDIR" ]]; then
+    echo "[INFO] Output directory exists, removing: $OUTDIR" >&2
+    rm -rf "$OUTDIR"
+fi
+
+mkdir -p "$OUTDIR"
+# IMPORTANT: do not pre-create ASM_DIR - MEGAHIT requires -o to not exist.
+
+echo "[1/3] MEGAHIT assembly" >&2
+
+if [[ "$R2" == "-" ]]; then
+    megahit -r "$R1" -o "$ASM_DIR" -t "$THREADS"
+else
+    megahit -1 "$R1" -2 "$R2" -o "$ASM_DIR" -t "$THREADS"
+fi
+
+CONTIGS="${ASM_DIR}/final.contigs.fa"
+if [[ ! -s "$CONTIGS" ]]; then
+    echo "ERROR: assembly did not produce contigs: $CONTIGS" >&2
+    exit 1
+fi
+
+mkdir -p "$MAP_DIR" "$PD_DIR"
+
+echo "[2/3] BWA-MEM mapping to contigs" >&2
+
+bwa index "$CONTIGS"
+
+BAM="${MAP_DIR}/${SAMPLE}.sorted.bam"
+if [[ "$R2" == "-" ]]; then
+    bwa mem -t "$THREADS" "$CONTIGS" "$R1" \
+      | samtools sort -@ "$THREADS" \
+          -T "${MAP_DIR}/${SAMPLE}.sorttmp" \
+          -o "$BAM"
+else
+    bwa mem -t "$THREADS" "$CONTIGS" "$R1" "$R2" \
+      | samtools sort -@ "$THREADS" \
+          -T "${MAP_DIR}/${SAMPLE}.sorttmp" \
+          -o "$BAM"
+fi
+samtools index "$BAM"
+
+echo "[2.5/3] Adding MD tag" >&2
+BAM_MD="${MAP_DIR}/${SAMPLE}.sorted.MD.bam"
+samtools calmd -b "$BAM" "$CONTIGS" > "$BAM_MD"
+samtools index "$BAM_MD"
+
+echo "[3/3] pydamage analyse" >&2
+
+# Older pydamage versions don't expose --bam / --reference / --outdir, so
+# we cd into PD_DIR and feed an absolute path to the BAM.
+BAM_MD_ABS="$(readlink -f "$BAM_MD")"
+(
+    cd "$PD_DIR"
+    pydamage analyze \
+        -p "$THREADS" \
+        -f \
+        -pl \
+        "$BAM_MD_ABS"
+)
+
+echo "Done." >&2
+echo "Contigs        : $CONTIGS"
+echo "Sorted BAM     : $BAM"
+echo "BAM with MD    : $BAM_MD"
+echo "pydamage dir   : $PD_DIR"

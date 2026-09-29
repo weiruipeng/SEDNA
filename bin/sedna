@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF="$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")"
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+VERSION="0.2.0"
+
+usage() {
+cat <<USAGE
+sedna $VERSION - integrated pipeline for sedimentary ancient DNA analysis
+
+Usage:
+  sedna <subcommand> [options...]
+
+Subcommands:
+  build-db            Build a customizable Bowtie2 reference database
+  run                 FASTQ -> Bowtie2 -> ngsLCA
+  damage              Per-taxon damage analysis on the alignment BAM
+  assemble-pydamage   de novo assembly + BWA + pydamage
+  extract-adna        Extract ancient-like reads from damaged contigs
+  bench               Wrap a command and record runtime / memory / versions
+
+Common options:
+  -h, --help          Show this help
+  -V, --version       Show version
+
+Per-subcommand help:
+  sedna <subcommand> --help
+USAGE
+}
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+fi
+
+case "$1" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    -V|--version|version)
+        echo "sedna $VERSION"
+        exit 0
+        ;;
+    build-db)
+        shift
+        exec "$BIN_DIR/sedna-build-db" "$@"
+        ;;
+    run)
+        shift
+        exec "$BIN_DIR/sedna-run" "$@"
+        ;;
+    damage|bamdam)
+        shift
+        exec "$BIN_DIR/sedna-bamdam" "$@"
+        ;;
+    assemble-pydamage)
+        shift
+        exec "$BIN_DIR/sedna-assemble-pydamage" "$@"
+        ;;
+    extract-adna)
+        shift
+        exec "$BIN_DIR/sedna-extract-adna" "$@"
+        ;;
+    bench)
+        shift
+        exec "$BIN_DIR/sedna-bench" "$@"
+        ;;
+    *)
+        echo "Unknown subcommand: $1" >&2
+        echo "Run 'sedna --help' for available subcommands." >&2
+        exit 1
+        ;;
+esac
