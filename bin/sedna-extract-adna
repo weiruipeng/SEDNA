@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+############################################################
+# sedna-extract-adna
+#
+# Filter contigs from a pydamage CSV by damage confidence, then extract
+# the corresponding reads (BAM region) and convert to FASTQ.
+############################################################
+
+usage() {
+cat <<'USAGE'
+Usage:
+  sedna extract-adna <pydamage_results.csv> <sorted.bam> <out_prefix> <single|paired> [threads]
+
+Single-end example:
+  sedna extract-adna sample136.work/pydamage/pydamage_results/pydamage_results.csv \
+                     sample136.work/mapping/sample136.sorted.MD.bam \
+                     sample136.ancient_like single 16
+
+Paired-end example:
+  sedna extract-adna pydamage_results.csv sample.sorted.MD.bam sample.ancient_like paired 16
+
+Output:
+  <out_prefix>.extract_ancient_like/   directory with filtered BAM and FASTQ
+USAGE
+}
+
+if [[ $# -lt 1 ]]; then usage; exit 1; fi
+case "$1" in -h|--help|help) usage; exit 0 ;; esac
+
+if [[ $# -lt 4 ]]; then
+    usage
+    exit 1
+fi
+
+PYDAMAGE_CSV="$1"
+BAM="$2"
+PREFIX="$3"
+MODE="$4"
+THREADS="${5:-4}"
+
+if [[ "$MODE" != "single" && "$MODE" != "paired" ]]; then
+    echo "ERROR: fourth argument must be 'single' or 'paired'" >&2
+    exit 1
+fi
+
+if [[ ! -s "$PYDAMAGE_CSV" ]]; then
+    echo "ERROR: pydamage CSV missing or empty: $PYDAMAGE_CSV" >&2
+    exit 1
+fi
+if [[ ! -s "$BAM" ]]; then
+    echo "ERROR: BAM missing or empty: $BAM" >&2
+    exit 1
+fi
+
+OUTDIR="${PREFIX}.extract_ancient_like"
+mkdir -p "$OUTDIR"
+
+CONTIG_LIST="${OUTDIR}/${PREFIX}.high_conf_damage_contigs.txt"
+BED="${OUTDIR}/${PREFIX}.high_conf_damage_contigs.bed"
+FILTERED_BAM="${OUTDIR}/${PREFIX}.ancient_like.bam"
+
+echo "[1/4] Filter high-confidence damaged contigs from pydamage CSV" >&2
+
+python3 - "$PYDAMAGE_CSV" "$CONTIG_LIST" "$BED" <<'PY'
+import sys
+import pandas as pd
+
+csv_file, contig_out, bed_out = sys.argv[1], sys.argv[2], sys.argv[3]
+
+df = pd.read_csv(csv_file)
+
+# Filter thresholds - tweak here for stricter/looser selection.
+MIN_PRED_ACC = 0.95
+MAX_QVALUE   = 0.05
+MIN_READS    = 100
+MIN_COVERAGE = 3
+MIN_CTOT0    = 0.03
+
+required_cols = [
+    "reference", "predicted_accuracy", "qvalue",
+    "nb_reads_aligned", "coverage", "reflen", "CtoT-0",
+]
+missing = [c for c in required_cols if c not in df.columns]
+if missing:
+    raise SystemExit(f"pydamage CSV missing columns: {missing}")
+
+f = df[
+    (df["predicted_accuracy"] >= MIN_PRED_ACC) &
+    (df["qvalue"] <= MAX_QVALUE) &
+    (df["nb_reads_aligned"] >= MIN_READS) &
+    (df["coverage"] >= MIN_COVERAGE) &
+    (df["CtoT-0"] >= MIN_CTOT0)
+].copy()
+
+f = f.sort_values(
+    ["predicted_accuracy", "CtoT-0", "nb_reads_aligned"],
+    ascending=[False, False, False],
+)
+
+with open(contig_out, "w") as out:
+    for ref in f["reference"]:
+        out.write(str(ref) + "\n")
+
+with open(bed_out, "w") as out:
+    for _, row in f.iterrows():
+        out.write(f"{row['reference']}\t0\t{int(row['reflen'])}\n")
+
+print(f"Total contigs in pydamage CSV     : {len(df)}")
+print(f"High-confidence damaged contigs   : {len(f)}")
+print("Filters:")
+print(f"  predicted_accuracy >= {MIN_PRED_ACC}")
+print(f"  qvalue             <= {MAX_QVALUE}")
+print(f"  nb_reads_aligned   >= {MIN_READS}")
+print(f"  coverage           >= {MIN_COVERAGE}")
+print(f"  CtoT-0             >= {MIN_CTOT0}")
+PY
+
+N_CONTIGS=$(grep -c . "$CONTIG_LIST" || true)
+if [[ "$N_CONTIGS" -eq 0 ]]; then
+    echo "No high-confidence damaged contigs survived the filters." >&2
+    echo "Consider lowering predicted_accuracy or CtoT-0 thresholds inside the script." >&2
+    exit 1
+fi
+
+echo "Damaged contigs: $N_CONTIGS"
+echo "Contig list   : $CONTIG_LIST"
+echo "BED file      : $BED"
+
+echo "[2/4] Extract reads aligned to damaged contigs" >&2
+
+# -F 2308 filters:
+#   4    unmapped
+#   256  secondary alignment
+#   2048 supplementary alignment
+# Use -F 3332 (adds 1024 = duplicate) if you also want to remove PCR duplicates.
+samtools view -@ "$THREADS" -b -F 2308 -L "$BED" "$BAM" > "$FILTERED_BAM"
+samtools index "$FILTERED_BAM"
+
+echo "[3/4] Count extracted alignments" >&2
+N_READS=$(samtools view -c "$FILTERED_BAM")
+echo "Extracted alignments: $N_READS"
+if [[ "$N_READS" -eq 0 ]]; then
+    echo "WARNING: no reads extracted. Check that the BAM contig names match" >&2
+    echo "         pydamage_results.csv 'reference' values." >&2
+    exit 1
+fi
+
+echo "[4/4] Convert to FASTQ" >&2
+
+if [[ "$MODE" == "single" ]]; then
+    FASTQ="${OUTDIR}/${PREFIX}.ancient_like.fastq.gz"
+    samtools fastq -@ "$THREADS" "$FILTERED_BAM" | gzip -c > "$FASTQ"
+    echo "Single-end FASTQ: $FASTQ"
+else
+    R1="${OUTDIR}/${PREFIX}.ancient_like.R1.fastq.gz"
+    R2="${OUTDIR}/${PREFIX}.ancient_like.R2.fastq.gz"
+    SINGLETON="${OUTDIR}/${PREFIX}.ancient_like.singleton.fastq.gz"
+    OTHER="${OUTDIR}/${PREFIX}.ancient_like.other.fastq.gz"
+    NAME_SORTED_BAM="${OUTDIR}/${PREFIX}.ancient_like.namesort.bam"
+
+    samtools sort -@ "$THREADS" -n -o "$NAME_SORTED_BAM" "$FILTERED_BAM"
+
+    samtools fastq -@ "$THREADS" \
+        -1 >(gzip -c > "$R1") \
+        -2 >(gzip -c > "$R2") \
+        -s >(gzip -c > "$SINGLETON") \
+        -0 >(gzip -c > "$OTHER") \
+        -n \
+        "$NAME_SORTED_BAM"
+
+    echo "Paired-end FASTQ:"
+    echo "  R1        : $R1"
+    echo "  R2        : $R2"
+    echo "  singleton : $SINGLETON"
+    echo "  other     : $OTHER"
+fi
+
+echo ""
+echo "Done. Output directory: $OUTDIR"
+echo "Key outputs:"
+echo "  contig list : $CONTIG_LIST"
+echo "  contig BED  : $BED"
+echo "  filtered BAM: $FILTERED_BAM"

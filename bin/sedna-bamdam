@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+###############################################################################
+# sedna-bamdam (NO FILTER, NO MIN-READS, NO TOP-N)
+# 
+# Fully removes abundance-driven selection and improves fault tolerance:
+#   - Does not rely on abundance.<rank>.tsv for taxon selection
+#   - Does not require --min-reads or --top
+#   - Extracts all taxa directly from bamdam outputs
+#   - Continues if a single taxon extraction fails
+#   - Continues if one rank fails
+#   - Runs evaluate only when the required TSV files are present
+###############################################################################
+
+usage() {
+cat <<'USAGE'
+Usage:
+  sedna damage \
+    --sedna-dir OUT_DIR \
+    [--ranks "species,genus,family"] \
+    [--stranded ds] \
+    [--upto genus] \
+    [--mode 1] \
+    [--udg] \
+    [--ref-fasta REF] \
+    [--k 29] \
+    [--safe-bam] \
+    [--extract-bam] \
+    [--evaluate] \
+    [--outdir DIR]
+
+Required:
+  --sedna-dir DIR       sedna-run output directory; must contain:
+                          out.name_sorted.bam
+                          lca_results.lca (or another lca_results* file)
+
+Optional:
+  --ranks STR           Comma-separated ranks. Default: species
+  --stranded STR        ss or ds, default: ds
+  --upto STR            default: same as rank
+  --mode INT            default: 1
+  --udg                 Add --udg to bamdam
+  --ref-fasta REF       Optional reference FASTA for calmd; can be memory-intensive
+  --k INT               k-mer length, default: 29
+  --safe-bam            Apply safe BAM filtering
+  --extract-bam         Extract BAM files and compute coverage
+  --evaluate            Run the comprehensive evaluation (needs species/genus/family TSVs)
+  --outdir DIR          Output directory, default: bamdam_native
+  -h, --help            show this help
+USAGE
+}
+
+log() { echo "[$(date '+%F %T')] $*" >&2; }
+die() { echo "[$(date '+%F %T')] ERROR: $*" >&2; exit 1; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+find_lca_file() {
+    local d="$1" f
+    for f in "$d/lca_results" "$d/lca_results.gz" "$d/lca_results.lca" "$d/lca_results.lca.gz" \
+             "$d/lca_results.tsv" "$d/lca_results.tsv.gz" "$d/lca_results.txt" "$d/lca_results.txt.gz"; do
+        [[ -s "$f" ]] && { echo "$f"; return 0; }
+    done
+    return 1
+}
+
+normalize_rank() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
+split_ranks() { echo "${1// /}" | tr ',' '\n' | awk 'NF{print}'; }
+
+# Default arguments
+SEDNA_DIR=""
+RANKS="species"
+STRANDED="ds"
+UPTO=""
+MODE=1
+UDG=0
+EXTRACT_BAM=0
+EVALUATE=0
+OUTDIR="bamdam_native"
+REF_FASTA=""
+KMER=29
+SAFE_BAM=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --sedna-dir) SEDNA_DIR="$2"; shift 2 ;;
+        --ranks) RANKS="$2"; shift 2 ;;
+        --stranded) STRANDED="$2"; shift 2 ;;
+        --upto) UPTO="$2"; shift 2 ;;
+        --mode) MODE="$2"; shift 2 ;;
+        --udg) UDG=1; shift ;;
+        --ref-fasta) REF_FASTA="$2"; shift 2 ;;
+        --k) KMER="$2"; shift 2 ;;
+        --safe-bam) SAFE_BAM=1; shift ;;
+        --extract-bam) EXTRACT_BAM=1; shift ;;
+        --evaluate) EVALUATE=1; shift ;;
+        --outdir) OUTDIR="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "Unknown argument: $1" ;;
+    esac
+done
+
+[[ -n "$SEDNA_DIR" ]] || die "--sedna-dir is required"
+case "$STRANDED" in ss|ds) ;; *) die "--stranded must be ss or ds" ;; esac
+
+SEDNA_DIR="$(readlink -f "$SEDNA_DIR")"
+mkdir -p "$OUTDIR"
+OUTDIR="$(cd "$OUTDIR" && pwd)"
+
+# Locate helper scripts
+SELF="$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")"
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+EVALUATE_SCRIPT=""
+PLOT_SCRIPT=""
+READ_COUNT_SCRIPT=""
+for candidate in "$BIN_DIR/../scripts/evaluate_adna_comprehensive.py" "$BIN_DIR/evaluate_adna_comprehensive.py"; do
+    [[ -f "$candidate" ]] && { EVALUATE_SCRIPT="$candidate"; break; }
+done
+for candidate in "$BIN_DIR/../scripts/plot_damage_curves.py" "$BIN_DIR/plot_damage_curves.py"; do
+    [[ -f "$candidate" ]] && { PLOT_SCRIPT="$candidate"; break; }
+done
+for candidate in "$BIN_DIR/../scripts/generate_read_counts.py" "$BIN_DIR/generate_read_counts.py"; do
+    [[ -f "$candidate" ]] && { READ_COUNT_SCRIPT="$candidate"; break; }
+done
+
+# Validate inputs
+BAM="${SEDNA_DIR}/out.name_sorted.bam"
+LCA="$(find_lca_file "$SEDNA_DIR")" || die "Could not find any lca_results* file in: $SEDNA_DIR"
+[[ -s "$BAM" ]] || die "BAM not found: $BAM"
+need_cmd python3 samtools
+
+log "SEDNA_DIR: $SEDNA_DIR"
+log "BAM: $BAM"
+log "LCA: $LCA"
+log "STRANDED: $STRANDED, MODE: $MODE"
+log "EXTRACT_BAM: $EXTRACT_BAM, EVALUATE: $EVALUATE"
+log "OUTDIR: $OUTDIR"
+
+# Prepare cleaned LCA and primary BAM
+CLEAN_LCA="${OUTDIR}/lca_results.clean.lca"
+PRIMARY_BAM="${OUTDIR}/out.name_sorted.primary.bam"
+BAM_MD="${OUTDIR}/out.name_sorted.primary.MD.bam"
+SAFE_BAM_PATH="${OUTDIR}/out.name_sorted.primary.safe.bam"
+BAM_FOR_BAMDAM=""
+
+ensure_clean_primary() {
+    if [[ ! -s "$CLEAN_LCA" ]]; then
+        log "Cleaning read-id suffixes in the LCA file -> $CLEAN_LCA"
+        awk 'BEGIN{FS=OFS="\t"} /^#/{print; next} /^->/{next} {n=split($1,a,":"); $1=a[1]; print}' "$LCA" > "$CLEAN_LCA"
+        [[ -s "$CLEAN_LCA" ]] || die "Failed to write: $CLEAN_LCA"
+    fi
+    if [[ ! -s "$PRIMARY_BAM" ]]; then
+        log "Filtering BAM to keep primary alignments that match the LCA file -> $PRIMARY_BAM"
+        awk '{print $1}' "$CLEAN_LCA" > "${OUTDIR}/lca_reads.txt"
+        samtools view -h -F 2308 -N "${OUTDIR}/lca_reads.txt" "$BAM" \
+            | awk 'BEGIN{prev=""} /^@/{print; next} {if ($1 != prev) {print; prev=$1}}' \
+            | samtools view -b -o "$PRIMARY_BAM" -
+        [[ -s "$PRIMARY_BAM" ]] || die "Failed to write: $PRIMARY_BAM"
+        rm -f "${OUTDIR}/lca_reads.txt"
+    fi
+
+    if [[ -n "$REF_FASTA" ]]; then
+        [[ -s "$REF_FASTA" ]] || die "Reference FASTA not found: $REF_FASTA"
+        if [[ ! -s "$BAM_MD" ]]; then
+            log "Adding MD tags with samtools calmd -> $BAM_MD"
+            samtools calmd -b "$PRIMARY_BAM" "$REF_FASTA" > "$BAM_MD" || die "calmd failed"
+        fi
+        BAM_FOR_BAMDAM="$BAM_MD"
+    else
+        BAM_FOR_BAMDAM="$PRIMARY_BAM"
+    fi
+
+    if [[ "$SAFE_BAM" -eq 1 && ! -s "$SAFE_BAM_PATH" ]]; then
+        log "Applying safe BAM filtering -> $SAFE_BAM_PATH (k=$KMER)"
+        samtools view -h "$BAM_FOR_BAMDAM" \
+            | awk -v k="$KMER" 'BEGIN{OFS="\t"} /^@/{print; next} {seq=$10; cigar=$6; if (seq=="*" || length(seq)<k || !(cigar ~ /^[0-9]+[M=X]+$/)) next; print}' \
+            | samtools view -b -o "$SAFE_BAM_PATH" -
+        [[ -s "$SAFE_BAM_PATH" ]] || die "Failed to write: $SAFE_BAM_PATH"
+        BAM_FOR_BAMDAM="$SAFE_BAM_PATH"
+    fi
+}
+
+# Run one rank (compute + optional extraction)
+run_one_rank() {
+    local rank="$1" upto="$2" sub_outdir="$3"
+    case "$rank" in species|genus|family|order|class|phylum|superkingdom) ;; *) log "WARNING: Unsupported rank: $rank; skipping"; return 0 ;; esac
+
+    local compute_dir="${sub_outdir}/compute" log_dir="${sub_outdir}/logs"
+    mkdir -p "$compute_dir" "$log_dir"
+    local out_tsv="${compute_dir}/bamdam.${rank}.upto_${upto}.tsv"
+    local out_subs="${compute_dir}/bamdam.${rank}.upto_${upto}.subs"
+
+    # ----- compute -----
+    log "[1/5] Running bamdam compute (rank=${rank}, upto=${upto})"
+    local compute_cmd=(bamdam compute --in_bam "$BAM_FOR_BAMDAM" --in_lca "$CLEAN_LCA"
+                       --out_tsv "$out_tsv" --out_subs "$out_subs" --stranded "$STRANDED"
+                       --upto "$upto" --mode "$MODE" --k "$KMER" --show_progress)
+    [[ "$UDG" -eq 1 ]] && compute_cmd+=(--udg)
+
+    if [[ ! -s "$out_tsv" || ! -s "$out_subs" ]]; then
+        log "Command: ${compute_cmd[*]}"
+        "${compute_cmd[@]}" > "${log_dir}/bamdam.compute.stdout.log" 2> "${log_dir}/bamdam.compute.stderr.log" || {
+            log "WARNING: bamdam compute failed; skipping this rank"
+            return 0
+        }
+    else
+        log "bamdam compute outputs already exist; skipping"
+    fi
+
+    [[ -s "$out_tsv" && -s "$out_subs" ]] || { log "WARNING: Missing bamdam outputs; skipping"; return 0; }
+
+    # ----- generate read count table -----
+    log "[2/5] Generating read-count summary (rank=${rank})"
+    local read_count_tsv="${sub_outdir}/read_counts.${rank}.tsv"
+    if [[ -n "$READ_COUNT_SCRIPT" && -f "$READ_COUNT_SCRIPT" ]]; then
+        python3 "$READ_COUNT_SCRIPT" --tsv "$out_tsv" --rank "$rank" --out "$read_count_tsv" \
+            > "${log_dir}/read_counts.stdout.log" 2> "${log_dir}/read_counts.stderr.log" || log "WARNING: read-count generation failed"
+    else
+        log "WARNING: generate_read_counts.py not found; skipping read-count table"
+    fi
+
+    # ----- generate damage plots -----
+    log "[3/5] Generating damage plots (rank=${rank})"
+    if [[ -n "$PLOT_SCRIPT" && -f "$PLOT_SCRIPT" ]]; then
+        python3 "$PLOT_SCRIPT" --subs "$out_subs" --tsv "$out_tsv" --outdir "$sub_outdir" \
+            > "${log_dir}/damage_plot.stdout.log" 2> "${log_dir}/damage_plot.stderr.log" || log "WARNING: damage plot generation failed"
+    else
+        log "WARNING: plot_damage_curves.py not found; skipping damage plots"
+    fi
+
+    # ----- extract all taxa from TSV -----
+    log "[4/5] Extracting all taxa from the bamdam TSV"
+    local taxon_list="${sub_outdir}/all_taxa_from_bamdam.txt"
+    python3 - "$out_tsv" "$taxon_list" <<'PY' || { log "WARNING: Failed to extract taxa"; return 0; }
+import sys, csv
+tsv, out = sys.argv[1], sys.argv[2]
+taxids=set()
+with open(tsv,'r',newline='') as f:
+    for row in csv.DictReader(f, delimiter='\t'):
+        tid=row.get('TaxNodeID','').strip()
+        if tid and tid not in ('NA','0'): taxids.add(tid)
+with open(out,'w') as f:
+    for t in sorted(taxids, key=int):
+        f.write(t+'\n')
+print(f"Total taxa: {len(taxids)}", file=sys.stderr)
+PY
+
+    local n_taxa
+    n_taxa=$(grep -c . "$taxon_list" 2>/dev/null || echo 0)
+    [[ "$n_taxa" -eq 0 ]] && { log "WARNING: No taxa found; skipping"; return 0; }
+    log "Found $n_taxa taxa"
+
+    # ----- extract BAM and coverage if enabled -----
+    if [[ "$EXTRACT_BAM" -eq 1 ]]; then
+        log "[5/5] Extracting BAM files and computing coverage"
+        local reads_dir="${sub_outdir}/reads_${rank}" cov_dir="${sub_outdir}/coverage_analysis"
+        mkdir -p "$reads_dir" "$cov_dir"
+
+        # Write read lists
+        log "Writing read lists -> $reads_dir"
+        python3 - "$CLEAN_LCA" "$taxon_list" "$rank" "$reads_dir" <<'PY' || log "WARNING: Read-list extraction failed; continuing"
+import sys, re, os
+clean_lca, taxon_file, rank, outdir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+taxa=set(open(taxon_file).read().strip().split())
+handles={}
+def get_handle(tid):
+    if tid not in handles:
+        handles[tid]=open(os.path.join(outdir, f"{tid}.reads.txt"), 'w', encoding='utf-8')
+    return handles[tid]
+pat=re.compile(r"^(\d+):[^:]+:([^:\s]+)")
+with open(clean_lca,'r',encoding='utf-8',errors='replace') as f:
+    for line in f:
+        line=line.rstrip('\n')
+        if not line or line.startswith('#'): continue
+        fields=line.split('\t')
+        if len(fields)<2: continue
+        read_id=fields[0]
+        for field in fields[1:]:
+            m=pat.match(field.strip())
+            if not m: continue
+            tid, r = m.group(1), m.group(2)
+            if r==rank and tid in taxa:
+                get_handle(tid).write(read_id+'\n')
+                break
+for h in handles.values(): h.close()
+print(f"Wrote {len(handles)} taxa", file=sys.stderr)
+PY
+
+        # Extract BAM and coverage for each taxon
+        log "Extracting BAM and coverage -> $reads_dir, $cov_dir"
+        local coverage_tsv="${sub_outdir}/coverage.${rank}.tsv"
+        echo -e "taxid\trank" > "$coverage_tsv"
+
+        # Temporarily disable -e so a single failure does not abort the whole run
+        set +e
+        while IFS= read -r TAXID; do
+            [[ -z "$TAXID" ]] && continue
+            local READS_LIST="${reads_dir}/${TAXID}.reads.txt"
+            local OUT_BAM="${reads_dir}/${TAXID}.bam"
+            local COV_FILE="${cov_dir}/${TAXID}_coverage.txt"
+
+            if [[ -s "$READS_LIST" ]]; then
+                log "  Processing taxon $TAXID"
+                # Extract BAM
+                samtools view -N "$READS_LIST" -b "$BAM_FOR_BAMDAM" > "$OUT_BAM" 2>/dev/null
+                if [[ -s "$OUT_BAM" ]]; then
+                    samtools index "$OUT_BAM" 2>/dev/null
+                    samtools coverage "$OUT_BAM" > "$COV_FILE" 2>/dev/null
+                else
+                    log "    WARNING: BAM is empty; skipping"
+                    touch "$COV_FILE"
+                fi
+                echo -e "$TAXID\t$rank" >> "$coverage_tsv"
+            else
+                log "  Skipping taxon $TAXID (missing read list)"
+            fi
+        done < "$taxon_list"
+        set -e
+    else
+        log "[5/5] --extract-bam is not enabled; skipping BAM extraction"
+    fi
+
+    log "Done rank=${rank}"
+    return 0
+}
+
+# Run evaluation if enabled
+run_evaluate() {
+    log "=============================================="
+    log "Running comprehensive evaluation with evaluate_adna_comprehensive.py"
+    log "=============================================="
+
+    [[ -z "$EVALUATE_SCRIPT" || ! -f "$EVALUATE_SCRIPT" ]] && { log "WARNING: Could not find the evaluate script; skipping"; return 0; }
+
+    # Check the required TSV files
+    local missing=0
+    for r in species genus family; do
+        if [[ ! -f "${OUTDIR}/${r}/compute/bamdam.${r}.upto_${r}.tsv" ]]; then
+            log "WARNING: Missing ${r}-level bamdam file; evaluation will be skipped"
+            missing=1
+        fi
+    done
+    if [[ $missing -eq 1 ]]; then
+        log "Evaluation skipped because required bamdam files are missing."
+        return 0
+    fi
+
+    cd "$OUTDIR"
+    python3 "$EVALUATE_SCRIPT" \
+        --bamdam_tsv "species/compute/bamdam.species.upto_species.tsv" \
+        --bamdam_subs "species/compute/bamdam.species.upto_species.subs" \
+        --genus_tsv "genus/compute/bamdam.genus.upto_genus.tsv" \
+        --family_tsv "family/compute/bamdam.family.upto_family.tsv" \
+        --min_reads 0 \
+        --top_n 999999 \
+        --output "comprehensive_adna_report.tsv" \
+        --output_detailed "comprehensive_adna_detailed.tsv"
+
+    log "Evaluation completed. Reports written to $OUTDIR"
+}
+
+# ==================== Main workflow ====================
+ensure_clean_primary
+
+# Process all ranks and continue even if one rank fails
+log "Running multiple ranks: $RANKS"
+while IFS= read -r r; do
+    r="$(normalize_rank "$r")"
+    [[ -n "$r" ]] || continue
+    local_outdir="${OUTDIR}/${r}"
+    log ">>> Processing rank: $r"
+    run_one_rank "$r" "$r" "$local_outdir" || log "WARNING: Rank $r failed, but continuing with the next one"
+done < <(split_ranks "$RANKS")
+
+log "ALL DONE"
+
+if [[ "$EVALUATE" -eq 1 ]]; then
+    run_evaluate
+fi

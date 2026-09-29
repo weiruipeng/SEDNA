@@ -1,0 +1,923 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+###############################################################################
+# sedna-build-db
+#
+# Build a customizable Bowtie2 reference database:
+#   1. nuclear  : NCBI assembly download OR local FASTA files
+#   2. organelle: NCBI nuccore retrieval per species (chloroplast / plastid /
+#                 mitochondrion)
+#   3. combine  : nuclear + organelle
+#   4. dedup    : seqkit rmdup -s (by sequence) then rmdup -n (by header)
+#   5. collapse : optional per-taxon scaffold concatenation
+#   6. bowtie2  : bowtie2-build
+###############################################################################
+
+ACCESSION_FILE=""
+OUTDIR=""
+TAXDB_DIR=""
+SPECIES_FILE="./species.txt"
+USE_EXISTING_GENOMES_ONLY=0
+GENOME_DIR=""
+CHUNK_SIZE=50
+THREADS=8
+FORCE_STAGE=""
+INDEX_PREFIX=""
+COLLAPSE_BY_TAXON=0
+
+NCBI_API_KEY="${NCBI_API_KEY:-}"
+NCBI_EMAIL="${NCBI_EMAIL:-}"
+NCBI_TOOL="sedna_build_db"
+NCBI_EUTILS_BASE="https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+EFETCH_BATCH_SIZE=100
+
+usage() {
+    cat <<'EOF'
+Usage:
+  sedna build-db [options]
+
+Required:
+  -o, --outdir DIR
+      Output directory. The pipeline writes:
+        OUTDIR/ncbi_reference.*.bt2  (or *.bt2l)
+        OUTDIR/work_build_db/...
+
+Nuclear genome input:
+  -a, --accessions FILE
+      List of NCBI assembly accessions (GCA_/GCF_).
+
+  --use-existing-genomes-only
+      Skip nuclear download; merge FASTAs from --genome-dir instead.
+
+  --genome-dir DIR
+      Directory of local nuclear FASTAs (recursive: .fa .fasta .fna .fa.gz
+      .fasta.gz .fna.gz).
+
+Organelle genome:
+  --species-file FILE
+      Two-column species/taxid list. Default: ./species.txt
+      Format:
+        Arabidopsis thaliana 3702
+        Oryza sativa         4530
+
+NCBI API:
+  --api-key KEY     NCBI API key
+  --email EMAIL     NCBI email
+
+Stage control:
+  --chunk-size N    Download chunk size (default: 50)
+  --threads N       Threads for dedup / bowtie2-build (default: 8)
+  --force-stage S   Re-run from stage S: genome|organelle|combine|dedup|
+                                          collapse|bowtie2|all
+
+Output options:
+  --collapse-by-taxon
+      Concatenate scaffolds of the same assembly into one record (joined by
+      100 Ns). Reduces FASTA header count and speeds up Bowtie2 lookup.
+
+  --index-prefix PREFIX
+      Bowtie2 index prefix. Default: OUTDIR/ncbi_reference
+
+Help:
+  -h, --help        Show this help
+
+Examples:
+  # 1) Download nuclear by accession + organelle by species file:
+  sedna build-db -a acc_list.txt -o ref_db \
+      --species-file species.txt --threads 16
+
+  # 2) Use local FASTAs:
+  sedna build-db -o ref_db \
+      --use-existing-genomes-only --genome-dir genomes/ \
+      --species-file species.txt --threads 16
+
+  # 3) Resume from organelle stage:
+  sedna build-db -o ref_db --use-existing-genomes-only \
+      --genome-dir genomes/ --species-file species.txt \
+      --force-stage organelle --threads 16
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -a|--accessions)               ACCESSION_FILE="$2"; shift 2 ;;
+        -o|--outdir)                   OUTDIR="$2"; shift 2 ;;
+        --taxdb-dir)                   TAXDB_DIR="$2"; shift 2 ;;
+        --species-file)                SPECIES_FILE="$2"; shift 2 ;;
+        --use-existing-genomes-only)   USE_EXISTING_GENOMES_ONLY=1; shift ;;
+        --genome-dir)                  GENOME_DIR="$2"; shift 2 ;;
+        --chunk-size)                  CHUNK_SIZE="$2"; shift 2 ;;
+        --threads)                     THREADS="$2"; shift 2 ;;
+        --force-stage)                 FORCE_STAGE="$2"; shift 2 ;;
+        --index-prefix)                INDEX_PREFIX="$2"; shift 2 ;;
+        --collapse-by-taxon)           COLLAPSE_BY_TAXON=1; shift ;;
+        --api-key)                     NCBI_API_KEY="$2"; shift 2 ;;
+        --email)                       NCBI_EMAIL="$2"; shift 2 ;;
+        -h|--help)                     usage; exit 0 ;;
+        *) echo "[ERROR] Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+done
+
+if [[ -z "$OUTDIR" ]]; then
+    echo "[ERROR] -o/--outdir is required" >&2
+    exit 1
+fi
+if [[ "$USE_EXISTING_GENOMES_ONLY" -eq 1 ]]; then
+    [[ -n "$GENOME_DIR" ]] || { echo "[ERROR] --use-existing-genomes-only requires --genome-dir" >&2; exit 1; }
+    [[ -d "$GENOME_DIR" ]] || { echo "[ERROR] genome dir not found: $GENOME_DIR" >&2; exit 1; }
+else
+    [[ -n "$ACCESSION_FILE" ]] || { echo "[ERROR] -a/--accessions is required unless --use-existing-genomes-only" >&2; exit 1; }
+    [[ -f "$ACCESSION_FILE" ]] || { echo "[ERROR] accession file not found: $ACCESSION_FILE" >&2; exit 1; }
+fi
+[[ -f "$SPECIES_FILE" ]] || { echo "[ERROR] species file not found: $SPECIES_FILE" >&2; exit 1; }
+
+if [[ -z "$INDEX_PREFIX" ]]; then
+    INDEX_PREFIX="${OUTDIR}/ncbi_reference"
+fi
+
+WORK_DIR="${OUTDIR}/work_build_db"
+STATUS_DIR="${WORK_DIR}/status"
+CHUNK_DIR="${WORK_DIR}/chunks"
+LOG_DIR="${WORK_DIR}/logs"
+TMP_DIR="${WORK_DIR}/tmp"
+
+NUCLEAR_FASTA="${WORK_DIR}/nuclear.fasta"
+ORGANELLE_FASTA="${WORK_DIR}/organelle.fasta"
+COMBINED_FASTA="${WORK_DIR}/combined.fasta"
+DEDUP_FASTA="${WORK_DIR}/combined.dedup.fasta"
+COLLAPSED_FASTA="${WORK_DIR}/combined.dedup.collapsed.fasta"
+
+mkdir -p "$OUTDIR" "$WORK_DIR" "$STATUS_DIR" "$CHUNK_DIR" "$LOG_DIR" "$TMP_DIR"
+
+RUN_LOG="${LOG_DIR}/run.log"
+ORG_API_STDERR_LOG="${LOG_DIR}/organelle_api.stderr.log"
+
+# -----------------------------------------------------------------------------
+# Logging - to stderr + run.log only. Never to stdout (captured by callers).
+# -----------------------------------------------------------------------------
+timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
+
+log()   { local m="[$(timestamp)] [INFO] $*"; printf '%s\n' "$m" >&2; printf '%s\n' "$m" >> "$RUN_LOG"; }
+warn()  { local m="[$(timestamp)] [WARN] $*"; printf '%s\n' "$m" >&2; printf '%s\n' "$m" >> "$RUN_LOG"; }
+error() { local m="[$(timestamp)] [ERROR] $*"; printf '%s\n' "$m" >&2; printf '%s\n' "$m" >> "$RUN_LOG"; }
+die()   { error "$*"; exit 1; }
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+check_dependencies() {
+    need_cmd curl
+    need_cmd python3
+    need_cmd bowtie2-build
+
+    if ! command -v seqkit >/dev/null 2>&1; then
+        warn "seqkit not detected; dedup will fall back to awk-by-header-id only."
+    fi
+
+    if [[ "$USE_EXISTING_GENOMES_ONLY" -eq 0 ]]; then
+        if command -v datasets >/dev/null 2>&1; then
+            log "Found NCBI datasets CLI; will use it for nuclear download."
+        elif command -v ncbi-genome-download >/dev/null 2>&1; then
+            log "Found ncbi-genome-download; will use it for nuclear download."
+        else
+            die "Need either 'datasets' or 'ncbi-genome-download' (or pass --use-existing-genomes-only)."
+        fi
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Stage status helpers
+# -----------------------------------------------------------------------------
+stage_done_file() { echo "${STATUS_DIR}/$1.done"; }
+is_stage_done()   { [[ -f "$(stage_done_file "$1")" ]]; }
+mark_stage_done() { touch "$(stage_done_file "$1")"; }
+remove_stage_done(){ rm -f "$(stage_done_file "$1")"; }
+
+apply_force_stage() {
+    case "$FORCE_STAGE" in
+        "") ;;
+        genome)
+            log "force-stage=genome"
+            remove_stage_done genome
+            remove_stage_done combine
+            remove_stage_done dedup
+            remove_stage_done collapse
+            remove_stage_done bowtie2
+            ;;
+        organelle)
+            log "force-stage=organelle"
+            remove_stage_done organelle
+            remove_stage_done combine
+            remove_stage_done dedup
+            remove_stage_done collapse
+            remove_stage_done bowtie2
+            rm -f "${STATUS_DIR}"/organelle_*.done || true
+            rm -f "$ORGANELLE_FASTA" || true
+            ;;
+        combine)
+            log "force-stage=combine"
+            remove_stage_done combine
+            remove_stage_done dedup
+            remove_stage_done collapse
+            remove_stage_done bowtie2
+            ;;
+        dedup)
+            log "force-stage=dedup"
+            remove_stage_done dedup
+            remove_stage_done collapse
+            remove_stage_done bowtie2
+            ;;
+        collapse)
+            log "force-stage=collapse"
+            remove_stage_done collapse
+            remove_stage_done bowtie2
+            ;;
+        bowtie2)
+            log "force-stage=bowtie2"
+            remove_stage_done bowtie2
+            ;;
+        all)
+            log "force-stage=all"
+            rm -f "${STATUS_DIR}"/*.done || true
+            rm -f "$NUCLEAR_FASTA" "$ORGANELLE_FASTA" "$COMBINED_FASTA" "$DEDUP_FASTA" "$COLLAPSED_FASTA" || true
+            ;;
+        *) die "Unknown --force-stage: $FORCE_STAGE" ;;
+    esac
+}
+
+save_run_config() {
+    cat > "${WORK_DIR}/run_config.txt" <<EOF
+ACCESSION_FILE=${ACCESSION_FILE}
+OUTDIR=${OUTDIR}
+TAXDB_DIR=${TAXDB_DIR}
+SPECIES_FILE=${SPECIES_FILE}
+USE_EXISTING_GENOMES_ONLY=${USE_EXISTING_GENOMES_ONLY}
+GENOME_DIR=${GENOME_DIR}
+CHUNK_SIZE=${CHUNK_SIZE}
+THREADS=${THREADS}
+FORCE_STAGE=${FORCE_STAGE}
+INDEX_PREFIX=${INDEX_PREFIX}
+COLLAPSE_BY_TAXON=${COLLAPSE_BY_TAXON}
+NCBI_API_KEY_SET=$([[ -n "$NCBI_API_KEY" ]] && echo yes || echo no)
+NCBI_EMAIL=${NCBI_EMAIL}
+NCBI_TOOL=${NCBI_TOOL}
+NCBI_EUTILS_BASE=${NCBI_EUTILS_BASE}
+EFETCH_BATCH_SIZE=${EFETCH_BATCH_SIZE}
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+urlencode() {
+    python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$1"
+}
+
+json_idlist_to_lines() {
+    python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for x in data.get("esearchresult", {}).get("idlist", []):
+        print(x)
+except Exception:
+    sys.exit(1)
+'
+}
+
+clean_numeric_ids() { awk '/^[0-9]+$/ {print}' | sort -u; }
+
+clean_accession_file() {
+    local infile="$1" outfile="$2"
+    grep -Eo 'GC[AF]_[0-9]+\.[0-9]+' "$infile" | sort -u > "$outfile" || true
+}
+
+split_file_to_chunks() {
+    local infile="$1" prefix="$2"
+    rm -f "${prefix}"_* || true
+    [[ -s "$infile" ]] || return 0
+    split -l "$CHUNK_SIZE" -d -a 5 "$infile" "${prefix}_"
+}
+
+parse_species_line() {
+    python3 - "$1" <<'PY'
+import sys, re
+line = sys.argv[1].strip()
+if not line or line.startswith("#"):
+    sys.exit(1)
+parts = line.split()
+if len(parts) < 2:
+    sys.exit(1)
+taxid = parts[-1]
+species = " ".join(parts[:-1])
+if not re.fullmatch(r"\d+", taxid):
+    sys.exit(1)
+print(species + "\t" + taxid)
+PY
+}
+
+# -----------------------------------------------------------------------------
+# NCBI E-utilities
+# -----------------------------------------------------------------------------
+ncbi_api_esearch_ids() {
+    local query="$1" retmax="${2:-100000}"
+    local encoded
+    encoded="$(urlencode "$query")"
+
+    local url="${NCBI_EUTILS_BASE}/esearch.fcgi?db=nuccore&term=${encoded}&retmax=${retmax}&retmode=json&tool=${NCBI_TOOL}"
+    [[ -n "$NCBI_EMAIL" ]]   && url="${url}&email=$(urlencode "$NCBI_EMAIL")"
+    [[ -n "$NCBI_API_KEY" ]] && url="${url}&api_key=${NCBI_API_KEY}"
+
+    curl -fsSL --retry 5 --retry-delay 3 --connect-timeout 20 --max-time 120 "$url" \
+        | json_idlist_to_lines \
+        | clean_numeric_ids
+}
+
+ncbi_api_efetch_fasta_batch() {
+    local id_csv="$1"
+    local post_args=(
+        -fsSL --retry 5 --retry-delay 3 --connect-timeout 20 --max-time 300
+        -X POST
+        --data-urlencode "db=nuccore"
+        --data-urlencode "id=${id_csv}"
+        --data-urlencode "rettype=fasta"
+        --data-urlencode "retmode=text"
+        --data-urlencode "tool=${NCBI_TOOL}"
+    )
+    [[ -n "$NCBI_EMAIL" ]]   && post_args+=( --data-urlencode "email=${NCBI_EMAIL}" )
+    [[ -n "$NCBI_API_KEY" ]] && post_args+=( --data-urlencode "api_key=${NCBI_API_KEY}" )
+
+    curl "${post_args[@]}" "${NCBI_EUTILS_BASE}/efetch.fcgi"
+}
+
+ncbi_api_efetch_fasta() {
+    local ids_file="$1" out_fa="$2"
+    local clean_file
+    clean_file="$(mktemp "${TMP_DIR}/ids.clean.XXXXXX.txt")"
+
+    clean_numeric_ids < "$ids_file" > "$clean_file"
+    if [[ ! -s "$clean_file" ]]; then
+        rm -f "$clean_file"
+        return 1
+    fi
+
+    : > "$out_fa"
+
+    local batch_prefix="${TMP_DIR}/efetch_ids_batch"
+    rm -f "${batch_prefix}"_* || true
+    split -l "$EFETCH_BATCH_SIZE" -d -a 5 "$clean_file" "${batch_prefix}_"
+
+    local batch_file id_csv
+    for batch_file in "${batch_prefix}"_*; do
+        [[ -f "$batch_file" ]] || continue
+        id_csv="$(paste -sd, "$batch_file")"
+        [[ -z "$id_csv" ]] && continue
+        ncbi_api_efetch_fasta_batch "$id_csv" >> "$out_fa"
+        sleep 0.34
+    done
+
+    rm -f "$clean_file" "${batch_prefix}"_* || true
+    grep -q "^>" "$out_fa"
+}
+
+download_organelle_query_by_api() {
+    local query="$1" outfile="$2" label="$3"
+
+    log "NCBI API query: ${label}"
+
+    local ids_file
+    ids_file="$(mktemp "${TMP_DIR}/ids.XXXXXX.txt")"
+
+    if ! ncbi_api_esearch_ids "$query" > "$ids_file" 2>> "$ORG_API_STDERR_LOG"; then
+        warn "esearch failed: ${label}"
+        rm -f "$ids_file"
+        return 1
+    fi
+
+    clean_numeric_ids < "$ids_file" > "${ids_file}.clean"
+    mv "${ids_file}.clean" "$ids_file"
+
+    if [[ ! -s "$ids_file" ]]; then
+        warn "No records for ${label}"
+        rm -f "$ids_file"
+        return 1
+    fi
+
+    local tmp_fa
+    tmp_fa="$(mktemp "${TMP_DIR}/efetch.XXXXXX.fa")"
+
+    if ncbi_api_efetch_fasta "$ids_file" "$tmp_fa" 2>> "$ORG_API_STDERR_LOG"; then
+        if grep -q "^>" "$tmp_fa"; then
+            cat "$tmp_fa" >> "$outfile"
+            echo >> "$outfile"
+            rm -f "$tmp_fa" "$ids_file"
+            log "efetch ok: ${label}"
+            return 0
+        else
+            warn "efetch produced no FASTA header: ${label}"
+            head -n 5 "$tmp_fa" >> "$RUN_LOG" || true
+            rm -f "$tmp_fa" "$ids_file"
+            return 1
+        fi
+    else
+        warn "efetch failed: ${label}"
+        [[ -s "$tmp_fa" ]] && head -n 5 "$tmp_fa" >> "$RUN_LOG" || true
+        rm -f "$tmp_fa" "$ids_file"
+        return 1
+    fi
+}
+
+build_organelle_query_precise() {
+    local taxid="$1" organelle="$2"
+    case "$organelle" in
+        chloroplast)   echo "txid${taxid}[Organism:exp] AND chloroplast[All Fields] AND complete genome[All Fields]" ;;
+        plastid)       echo "txid${taxid}[Organism:exp] AND plastid[All Fields] AND complete genome[All Fields]" ;;
+        mitochondrion) echo "txid${taxid}[Organism:exp] AND mitochondrion[All Fields] AND complete genome[All Fields]" ;;
+        *) return 1 ;;
+    esac
+}
+
+build_organelle_query_broad() {
+    local taxid="$1" organelle="$2"
+    case "$organelle" in
+        chloroplast)   echo "txid${taxid}[Organism:exp] AND chloroplast[All Fields]" ;;
+        plastid)       echo "txid${taxid}[Organism:exp] AND plastid[All Fields]" ;;
+        mitochondrion) echo "txid${taxid}[Organism:exp] AND mitochondrion[All Fields]" ;;
+        *) return 1 ;;
+    esac
+}
+
+download_one_species_organelle_by_api() {
+    local species="$1" taxid="$2" outfile="$3"
+    local organelle query label
+    for organelle in chloroplast plastid mitochondrion; do
+        label="${species} taxid=${taxid} ${organelle}"
+        query="$(build_organelle_query_precise "$taxid" "$organelle")"
+        if download_organelle_query_by_api "$query" "$outfile" "$label precise"; then
+            sleep 0.34
+            continue
+        fi
+        warn "precise failed, trying broad: ${label}"
+        query="$(build_organelle_query_broad "$taxid" "$organelle")"
+        download_organelle_query_by_api "$query" "$outfile" "$label broad" || true
+        sleep 0.34
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Stage 1: nuclear genome
+# -----------------------------------------------------------------------------
+stage_genome_existing() {
+    log "Stage genome: merging local FASTAs from ${GENOME_DIR}"
+    rm -f "$NUCLEAR_FASTA"
+    : > "$NUCLEAR_FASTA"
+
+    local found=0
+    while IFS= read -r -d '' file; do
+        found=1
+        log "Merging: $file"
+        case "$file" in
+            *.gz) gzip -cd "$file" >> "$NUCLEAR_FASTA" ;;
+            *)    cat "$file"       >> "$NUCLEAR_FASTA" ;;
+        esac
+        echo >> "$NUCLEAR_FASTA"
+    done < <(
+        find "$GENOME_DIR" -type f \( \
+            -name "*.fa" -o -name "*.fasta" -o -name "*.fna" -o \
+            -name "*.fa.gz" -o -name "*.fasta.gz" -o -name "*.fna.gz" \
+        \) -print0
+    )
+
+    [[ "$found" -eq 1 ]]               || die "No FASTA files in ${GENOME_DIR}"
+    grep -q "^>" "$NUCLEAR_FASTA"     || die "Merged nuclear FASTA has no headers: $NUCLEAR_FASTA"
+    log "Local nuclear FASTA merged: $NUCLEAR_FASTA"
+}
+
+stage_genome_download_with_datasets() {
+    local clean_accessions="$1"
+    local chunk_prefix="${CHUNK_DIR}/accession_chunk"
+
+    log "Stage genome: downloading via NCBI datasets"
+    split_file_to_chunks "$clean_accessions" "$chunk_prefix"
+
+    rm -f "$NUCLEAR_FASTA"
+    : > "$NUCLEAR_FASTA"
+
+    local chunk
+    for chunk in "${chunk_prefix}"_*; do
+        [[ -f "$chunk" ]] || continue
+        local chunk_name done_file
+        chunk_name="$(basename "$chunk")"
+        done_file="${STATUS_DIR}/genome_${chunk_name}.done"
+
+        if [[ -f "$done_file" ]]; then
+            log "Chunk already done: $chunk_name"
+            continue
+        fi
+
+        log "Downloading chunk: $chunk_name"
+        local chunk_out="${WORK_DIR}/datasets_${chunk_name}"
+        local zip_file="${chunk_out}.zip"
+        rm -rf "$chunk_out" "$zip_file"
+        mkdir -p "$chunk_out"
+
+        if datasets download genome accession \
+            --inputfile "$chunk" \
+            --include genome \
+            --filename "$zip_file" \
+            >> "${LOG_DIR}/datasets.stdout.log" \
+            2>> "${LOG_DIR}/datasets.stderr.log"; then
+
+            unzip -q "$zip_file" -d "$chunk_out"
+
+            while IFS= read -r -d '' fa; do
+                log "Appending: $fa"
+                cat "$fa" >> "$NUCLEAR_FASTA"
+                echo >> "$NUCLEAR_FASTA"
+            done < <(
+                find "$chunk_out" -type f \( \
+                    -name "*.fna" -o -name "*.fa" -o -name "*.fasta" \
+                \) -print0
+            )
+
+            touch "$done_file"
+        else
+            warn "datasets failed for $chunk_name"
+        fi
+    done
+
+    grep -q "^>" "$NUCLEAR_FASTA" || die "Nuclear FASTA empty / no headers: $NUCLEAR_FASTA"
+}
+
+stage_genome_download_with_ncbi_genome_download() {
+    local clean_accessions="$1"
+
+    log "Stage genome: downloading via ncbi-genome-download"
+    rm -f "$NUCLEAR_FASTA"; : > "$NUCLEAR_FASTA"
+
+    local download_dir="${WORK_DIR}/ncbi_genome_download"
+    mkdir -p "$download_dir"
+
+    if ncbi-genome-download all \
+        --assembly-accessions "$clean_accessions" \
+        --formats fasta \
+        --output-folder "$download_dir" \
+        --flat-output \
+        --parallel "$THREADS" \
+        >> "${LOG_DIR}/ncbi_genome_download.stdout.log" \
+        2>> "${LOG_DIR}/ncbi_genome_download.stderr.log"; then
+
+        while IFS= read -r -d '' fa; do
+            log "Appending: $fa"
+            case "$fa" in
+                *.gz) gzip -cd "$fa" >> "$NUCLEAR_FASTA" ;;
+                *)    cat "$fa"       >> "$NUCLEAR_FASTA" ;;
+            esac
+            echo >> "$NUCLEAR_FASTA"
+        done < <(
+            find "$download_dir" -type f \( \
+                -name "*.fna.gz" -o -name "*.fa.gz" -o -name "*.fasta.gz" -o \
+                -name "*.fna" -o -name "*.fa" -o -name "*.fasta" \
+            \) -print0
+        )
+    else
+        die "ncbi-genome-download failed"
+    fi
+
+    grep -q "^>" "$NUCLEAR_FASTA" || die "Nuclear FASTA empty / no headers"
+}
+
+stage_genome() {
+    if is_stage_done genome; then log "Stage genome already done, skipping."; return 0; fi
+    log "========== Stage 1: genome =========="
+
+    if [[ "$USE_EXISTING_GENOMES_ONLY" -eq 1 ]]; then
+        stage_genome_existing
+    else
+        local clean_accessions="${WORK_DIR}/accessions.clean.txt"
+        clean_accession_file "$ACCESSION_FILE" "$clean_accessions"
+        [[ -s "$clean_accessions" ]] || die "No valid GCA/GCF accessions in: $ACCESSION_FILE"
+
+        if command -v datasets >/dev/null 2>&1; then
+            stage_genome_download_with_datasets "$clean_accessions"
+        elif command -v ncbi-genome-download >/dev/null 2>&1; then
+            stage_genome_download_with_ncbi_genome_download "$clean_accessions"
+        else
+            die "Neither datasets nor ncbi-genome-download available"
+        fi
+    fi
+
+    mark_stage_done genome
+    log "Stage genome done."
+}
+
+# -----------------------------------------------------------------------------
+# Stage 2: organelle
+# -----------------------------------------------------------------------------
+prepare_species_clean_file() {
+    local outfile="$1"
+    rm -f "$outfile"
+    : > "$outfile"
+
+    local line parsed
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line//$'\r'/}"
+        [[ -z "$line" ]]                         && continue
+        [[ "$line" =~ ^[[:space:]]*# ]]          && continue
+        if parsed="$(parse_species_line "$line" 2>/dev/null)"; then
+            echo "$parsed" >> "$outfile"
+        else
+            warn "Could not parse species line: $line"
+        fi
+    done < "$SPECIES_FILE"
+
+    sort -u "$outfile" -o "$outfile"
+    [[ -s "$outfile" ]] || die "Species file is empty after parsing: $SPECIES_FILE"
+}
+
+stage_organelle() {
+    if is_stage_done organelle; then log "Stage organelle already done, skipping."; return 0; fi
+    log "========== Stage 2: organelle (NCBI nuccore) =========="
+
+    local clean_species="${WORK_DIR}/species.clean.tsv"
+    prepare_species_clean_file "$clean_species"
+
+    local chunk_prefix="${CHUNK_DIR}/species_chunk"
+    split_file_to_chunks "$clean_species" "$chunk_prefix"
+
+    rm -f "$ORGANELLE_FASTA"
+    : > "$ORGANELLE_FASTA"
+
+    local chunk chunk_name done_file species taxid
+    for chunk in "${chunk_prefix}"_*; do
+        [[ -f "$chunk" ]] || continue
+        chunk_name="$(basename "$chunk")"
+        done_file="${STATUS_DIR}/organelle_${chunk_name}.done"
+
+        if [[ -f "$done_file" ]]; then
+            log "Chunk already done: $chunk_name"
+            continue
+        fi
+
+        log "Processing chunk: $chunk_name"
+        while IFS=$'\t' read -r species taxid; do
+            [[ -z "${species:-}" || -z "${taxid:-}" ]] && continue
+            log "Organelle download: species='${species}' taxid=${taxid}"
+            download_one_species_organelle_by_api "$species" "$taxid" "$ORGANELLE_FASTA" || true
+            sleep 0.34
+        done < "$chunk"
+
+        touch "$done_file"
+        log "Chunk done: $chunk_name"
+    done
+
+    if [[ ! -s "$ORGANELLE_FASTA" ]]; then
+        warn "Organelle FASTA empty; downstream will use nuclear only."
+    elif ! grep -q "^>" "$ORGANELLE_FASTA"; then
+        warn "Organelle FASTA has no headers; clearing."
+        : > "$ORGANELLE_FASTA"
+    else
+        log "Organelle FASTA ready: $ORGANELLE_FASTA"
+    fi
+
+    mark_stage_done organelle
+    log "Stage organelle done."
+}
+
+# -----------------------------------------------------------------------------
+# Stage 3: combine
+# -----------------------------------------------------------------------------
+stage_combine() {
+    if is_stage_done combine; then log "Stage combine already done, skipping."; return 0; fi
+    log "========== Stage 3: combine =========="
+    [[ -s "$NUCLEAR_FASTA" ]] || die "Nuclear FASTA missing or empty: $NUCLEAR_FASTA"
+
+    rm -f "$COMBINED_FASTA"
+    cat "$NUCLEAR_FASTA" > "$COMBINED_FASTA"
+    echo >> "$COMBINED_FASTA"
+
+    if [[ -s "$ORGANELLE_FASTA" ]]; then
+        cat "$ORGANELLE_FASTA" >> "$COMBINED_FASTA"
+        echo >> "$COMBINED_FASTA"
+        log "Combined nuclear + organelle."
+    else
+        warn "Organelle FASTA empty; combined = nuclear only."
+    fi
+
+    grep -q "^>" "$COMBINED_FASTA" || die "Combined FASTA has no headers"
+    mark_stage_done combine
+    log "Stage combine done: $COMBINED_FASTA"
+}
+
+# -----------------------------------------------------------------------------
+# Stage 4: dedup (sequence + header)
+# -----------------------------------------------------------------------------
+dedup_by_awk_header() {
+    local infile="$1" outfile="$2"
+    awk '
+BEGIN { keep=0 }
+{
+    if ($0 ~ /^>/) {
+        id=$0; sub(/^>/, "", id)
+        split(id, a, /[ \t]/); id=a[1]
+        if (seen[id]++) { keep=0 } else { keep=1; print $0 }
+    } else if (keep) { print $0 }
+}
+' "$infile" > "$outfile"
+}
+
+stage_dedup() {
+    if is_stage_done dedup; then log "Stage dedup already done, skipping."; return 0; fi
+    log "========== Stage 4: dedup =========="
+    [[ -s "$COMBINED_FASTA" ]] || die "Combined FASTA missing: $COMBINED_FASTA"
+
+    rm -f "$DEDUP_FASTA"
+
+    if command -v seqkit >/dev/null 2>&1; then
+        log "seqkit rmdup -s (by sequence), then -n (by header id)"
+        # Two-step pipeline:
+        #   -s removes content duplicates (saves disk),
+        #   -n removes header-id duplicates (prevents 'Duplicate entry' in
+        #      samtools sort when headers collide).
+        seqkit rmdup -s -j "$THREADS" "$COMBINED_FASTA" 2>> "${LOG_DIR}/seqkit_rmdup.stderr.log" \
+          | seqkit rmdup -n -j "$THREADS" -o "$DEDUP_FASTA" \
+              2>> "${LOG_DIR}/seqkit_rmdup_byname.stderr.log"
+    else
+        warn "seqkit unavailable; falling back to awk header-only dedup"
+        dedup_by_awk_header "$COMBINED_FASTA" "$DEDUP_FASTA"
+    fi
+
+    [[ -s "$DEDUP_FASTA" ]]        || die "Dedup FASTA empty: $DEDUP_FASTA"
+    grep -q "^>" "$DEDUP_FASTA"    || die "Dedup FASTA has no headers"
+
+    mark_stage_done dedup
+    log "Stage dedup done: $DEDUP_FASTA"
+}
+
+# -----------------------------------------------------------------------------
+# Stage 4.5: optional collapse-by-taxon
+# -----------------------------------------------------------------------------
+stage_collapse() {
+    if [[ "$COLLAPSE_BY_TAXON" -ne 1 ]]; then
+        log "collapse-by-taxon disabled; skipping."
+        return 0
+    fi
+    if is_stage_done collapse; then log "Stage collapse already done, skipping."; return 0; fi
+    log "========== Stage 4.5: collapse-by-taxon =========="
+    [[ -s "$DEDUP_FASTA" ]] || die "Dedup FASTA missing: $DEDUP_FASTA"
+
+    # Heuristic for grouping records into one "taxon":
+    #   - For NCBI datasets/RefSeq headers, the prefix before the first space
+    #     plus its accession share a stable scaffold prefix (e.g. CM... or
+    #     JANV...). To stay safe and predictable we group by the part of the
+    #     header before the first '.' if it matches a typical NCBI prefix,
+    #     otherwise we group by the full first token. Adjust this script
+    #     if your headers follow a different convention.
+    python3 - "$DEDUP_FASTA" "$COLLAPSED_FASTA" <<'PY'
+import sys, re
+in_fa, out_fa = sys.argv[1], sys.argv[2]
+
+def group_key(header_first_token):
+    # Standard NCBI accession with a version: KP940528.1, NC_058520.1, etc.
+    m = re.match(r"^([A-Z]+_?\d+)\.\d+", header_first_token)
+    if m:
+        return m.group(1)
+    # GenBank assembly-scaffold pattern (e.g. CM046321.1)
+    m = re.match(r"^([A-Z]{2,}\d+)", header_first_token)
+    if m:
+        return m.group(1)
+    # Fallback: use the whole first token (no collapsing happens).
+    return header_first_token
+
+# Read records grouped by key, in order of first appearance.
+groups = {}     # key -> list of seq strings
+order  = []     # preserves first-seen order
+header_for = {} # key -> display header used in output
+
+current_key = None
+current_seq_chunks = []
+current_header = None
+
+def flush():
+    global current_key, current_seq_chunks, current_header
+    if current_key is None:
+        return
+    seq = "".join(current_seq_chunks)
+    if current_key not in groups:
+        groups[current_key] = []
+        order.append(current_key)
+        header_for[current_key] = current_header
+    groups[current_key].append(seq)
+    current_key, current_seq_chunks, current_header = None, [], None
+
+with open(in_fa, "rt", errors="replace") as f:
+    for line in f:
+        if line.startswith(">"):
+            flush()
+            current_header = line[1:].rstrip("\n").split()[0]
+            current_key = group_key(current_header)
+            current_seq_chunks = []
+        else:
+            current_seq_chunks.append(line.strip())
+    flush()
+
+LINKER = "N" * 100
+
+with open(out_fa, "wt") as f:
+    for key in order:
+        seqs = groups[key]
+        first_header = header_for[key]
+        # Use the group key as the new header so downstream tools see a stable id.
+        new_header = key if key != first_header else first_header
+        if len(seqs) == 1:
+            joined = seqs[0]
+            note = "single"
+        else:
+            joined = LINKER.join(seqs)
+            note = f"collapsed_n={len(seqs)}"
+        f.write(f">{new_header} {note}\n")
+        # Wrap at 80 cols for sanity.
+        for i in range(0, len(joined), 80):
+            f.write(joined[i:i+80] + "\n")
+
+sys.stderr.write(f"[INFO] groups written: {len(order)}\n")
+PY
+
+    [[ -s "$COLLAPSED_FASTA" ]] || die "Collapsed FASTA empty: $COLLAPSED_FASTA"
+    grep -q "^>" "$COLLAPSED_FASTA" || die "Collapsed FASTA has no headers"
+
+    mark_stage_done collapse
+    log "Stage collapse done: $COLLAPSED_FASTA"
+}
+
+# -----------------------------------------------------------------------------
+# Stage 5: bowtie2-build
+# -----------------------------------------------------------------------------
+stage_bowtie2() {
+    if is_stage_done bowtie2; then log "Stage bowtie2 already done, skipping."; return 0; fi
+    log "========== Stage 5: bowtie2-build =========="
+
+    local input_fa
+    if [[ "$COLLAPSE_BY_TAXON" -eq 1 ]]; then
+        input_fa="$COLLAPSED_FASTA"
+    else
+        input_fa="$DEDUP_FASTA"
+    fi
+    [[ -s "$input_fa" ]] || die "Bowtie2 input FASTA missing: $input_fa"
+
+    mkdir -p "$(dirname "$INDEX_PREFIX")"
+
+    log "bowtie2-build:"
+    log "  input  : $input_fa"
+    log "  prefix : $INDEX_PREFIX"
+    log "  threads: $THREADS"
+
+    # --large-index is selected automatically by bowtie2-build when needed
+    # for FASTAs > 4 Gbp, but we pass --large-index explicitly when the input
+    # is plainly above the safe threshold to avoid a re-run.
+    local fasta_bytes
+    fasta_bytes=$(stat -c '%s' "$input_fa" 2>/dev/null || stat -f '%z' "$input_fa")
+    local large_flag=()
+    if [[ "$fasta_bytes" -gt 4000000000 ]]; then
+        log "Input > 4 GB; using --large-index"
+        large_flag=(--large-index)
+    fi
+
+    bowtie2-build "${large_flag[@]}" \
+        --threads "$THREADS" \
+        "$input_fa" \
+        "$INDEX_PREFIX" \
+        >> "${LOG_DIR}/bowtie2-build.stdout.log" \
+        2>> "${LOG_DIR}/bowtie2-build.stderr.log"
+
+    if compgen -G "${INDEX_PREFIX}*.bt2" > /dev/null || compgen -G "${INDEX_PREFIX}*.bt2l" > /dev/null; then
+        log "Bowtie2 index built."
+    else
+        die "No Bowtie2 index output detected at ${INDEX_PREFIX}*"
+    fi
+
+    mark_stage_done bowtie2
+    log "Stage bowtie2 done."
+}
+
+main() {
+    log "sedna-build-db starting"
+
+    check_dependencies
+    save_run_config
+    apply_force_stage
+
+    stage_genome
+    stage_organelle
+    stage_combine
+    stage_dedup
+    stage_collapse
+    stage_bowtie2
+
+    log "All stages complete."
+    log "Bowtie2 index prefix: $INDEX_PREFIX"
+}
+
+main "$@"

@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""sedna-bench - wrap any command and record runtime / memory / versions.
+
+Usage:
+  # Wrap mode - execute a command and record a JSON profile
+  sedna-bench [--label LABEL] [--out-dir DIR] -- COMMAND [ARGS...]
+
+  # Summary mode - aggregate all *.json records into a Markdown table
+  sedna-bench --summary DIR
+
+Examples:
+  sedna-bench --label build_db -- sedna build-db -a acc.txt -o ref --threads 16
+  sedna-bench --label run     -- sedna run -i r.fq.gz -o out --ref-dir ref --taxdb-dir tax -t 16
+  sedna-bench --summary ./bench
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import resource
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ----------------------------------------------------------------------
+# Tools whose --version (or first stderr line) we capture
+# ----------------------------------------------------------------------
+VERSION_PROBES = [
+    ("sedna",       ["sedna", "--version"]),
+    ("python3",     ["python3", "--version"]),
+    ("bowtie2",     ["bowtie2", "--version"]),
+    ("bwa",         ["bwa"]),
+    ("samtools",    ["samtools", "--version"]),
+    ("seqkit",      ["seqkit", "version"]),
+    ("megahit",     ["megahit", "--version"]),
+    ("ngsLCA",      ["ngsLCA"]),
+    ("pydamage",    ["pydamage", "--version"]),
+    ("bamdam",      ["bamdam", "--version"]),
+    ("datasets",    ["datasets", "--version"]),
+    ("esearch",     ["esearch", "-version"]),
+]
+
+
+def probe_version(cmd):
+    """Run a command, capture its first non-empty output line. Return None on failure."""
+    if shutil.which(cmd[0]) is None:
+        return None
+    try:
+        r = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+            text=True,
+        )
+        first = next((ln.strip() for ln in r.stdout.splitlines() if ln.strip()), "")
+        return first or None
+    except Exception:
+        return None
+
+
+def collect_versions():
+    return {name: probe_version(cmd) for name, cmd in VERSION_PROBES}
+
+
+# ----------------------------------------------------------------------
+# I/O sniffing
+# ----------------------------------------------------------------------
+def file_size(p):
+    try:
+        return os.path.getsize(p)
+    except OSError:
+        return None
+
+
+def sniff_inputs(argv):
+    """Pull common input-flag values out of the wrapped command line."""
+    pairs = {}
+    keys = {
+        "-i": "input", "--input": "input",
+        "-a": "accessions", "--accessions": "accessions",
+        "--ref-dir": "ref_dir",
+        "--taxdb-dir": "taxdb_dir",
+        "--genome-dir": "genome_dir",
+        "--species-file": "species_file",
+        "--sedna-dir": "sedna_dir",
+    }
+    i = 0
+    while i < len(argv) - 1:
+        if argv[i] in keys:
+            pairs[keys[argv[i]]] = argv[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    out = {}
+    for k, v in pairs.items():
+        out[k] = {"path": v, "size_bytes": file_size(v) if os.path.isfile(v) else None}
+    return out
+
+
+def sniff_outputs(argv):
+    """Pull the output directory and report its on-disk footprint."""
+    out_dir = None
+    for flag in ("-o", "--output", "--outdir"):
+        if flag in argv:
+            idx = argv.index(flag)
+            if idx + 1 < len(argv):
+                out_dir = argv[idx + 1]
+                break
+    if not out_dir:
+        return {}
+
+    info = {"path": out_dir}
+    if os.path.isdir(out_dir):
+        total = 0
+        n_files = 0
+        for root, _, files in os.walk(out_dir):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                try:
+                    total += os.path.getsize(fp)
+                    n_files += 1
+                except OSError:
+                    pass
+        info["total_size_bytes"] = total
+        info["n_files"] = n_files
+    elif os.path.isfile(out_dir):
+        info["size_bytes"] = file_size(out_dir)
+    return info
+
+
+# ----------------------------------------------------------------------
+# Execute with resource accounting
+# ----------------------------------------------------------------------
+def run_and_measure(cmd):
+    start_wall = time.time()
+    proc = subprocess.Popen(cmd)
+    rc = proc.wait()
+    end_wall = time.time()
+
+    ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+    # ru_maxrss is kilobytes on Linux, bytes on macOS/BSD
+    if sys.platform == "darwin":
+        peak_rss_mb = ru.ru_maxrss / (1024 * 1024)
+    else:
+        peak_rss_mb = ru.ru_maxrss / 1024
+
+    return {
+        "exit_code": rc,
+        "wall_clock_seconds": round(end_wall - start_wall, 3),
+        "user_cpu_seconds": round(ru.ru_utime, 3),
+        "system_cpu_seconds": round(ru.ru_stime, 3),
+        "peak_rss_mb": round(peak_rss_mb, 1),
+        "start_time": datetime.fromtimestamp(start_wall, timezone.utc).isoformat(),
+        "end_time": datetime.fromtimestamp(end_wall, timezone.utc).isoformat(),
+    }
+
+
+# ----------------------------------------------------------------------
+# Wrap mode
+# ----------------------------------------------------------------------
+def cmd_wrap(label, out_dir, rest):
+    if not rest:
+        print("ERROR: no command to run after '--'", file=sys.stderr)
+        return 2
+
+    if not label:
+        if len(rest) >= 2 and rest[0] == "sedna":
+            label = f"sedna_{rest[1]}"
+        else:
+            label = os.path.basename(rest[0])
+        label = label.replace("/", "_").replace("-", "_")
+
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    out_json = os.path.join(out_dir, f"{label}.json")
+
+    print(f"[sedna-bench] label = {label}", file=sys.stderr)
+    print(f"[sedna-bench] cmd   = {' '.join(rest)}", file=sys.stderr)
+    print(f"[sedna-bench] out   = {out_json}", file=sys.stderr)
+
+    versions = collect_versions()
+    inputs = sniff_inputs(rest)
+    measure = run_and_measure(rest)
+    outputs = sniff_outputs(rest)
+
+    record = {
+        "label": label,
+        "stamp": stamp,
+        "host": {
+            "platform": platform.platform(),
+            "cpu_count": os.cpu_count(),
+            "python_version": platform.python_version(),
+        },
+        "command": rest,
+        "command_str": " ".join(rest),
+        "versions": versions,
+        "inputs": inputs,
+        "outputs": outputs,
+        **measure,
+    }
+
+    with open(out_json, "w") as f:
+        json.dump(record, f, indent=2)
+
+    print(
+        f"[sedna-bench] done: rc={measure['exit_code']} "
+        f"wall={measure['wall_clock_seconds']}s "
+        f"peakRSS={measure['peak_rss_mb']} MB",
+        file=sys.stderr,
+    )
+    return measure["exit_code"]
+
+
+# ----------------------------------------------------------------------
+# Summary mode
+# ----------------------------------------------------------------------
+def fmt_seconds(s):
+    if s is None:
+        return "-"
+    if s < 60:
+        return f"{s:.1f}s"
+    m, sec = divmod(int(s), 60)
+    if m < 60:
+        return f"{m}m{sec:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def fmt_bytes(b):
+    if b is None:
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    x = float(b)
+    for u in units:
+        if x < 1024 or u == units[-1]:
+            return f"{x:.1f} {u}"
+        x /= 1024
+
+
+def cmd_summary(directory):
+    p = Path(directory)
+    files = sorted(p.glob("*.json"))
+    if not files:
+        print(f"ERROR: no *.json in {directory}", file=sys.stderr)
+        return 2
+
+    records = []
+    for fp in files:
+        try:
+            with open(fp) as f:
+                records.append(json.load(f))
+        except Exception as e:
+            print(f"WARN: skip {fp}: {e}", file=sys.stderr)
+
+    print("# SEDNA benchmark summary\n")
+    print(f"Source: `{directory}`  records: {len(records)}\n")
+
+    print("| Module | Wall time | CPU (user+sys) | Peak RSS | Exit | Output size | Command |")
+    print("|---|---|---|---|---|---|---|")
+    for r in records:
+        cpu = (r.get("user_cpu_seconds") or 0) + (r.get("system_cpu_seconds") or 0)
+        out_sz = (r.get("outputs") or {}).get("total_size_bytes") \
+              or (r.get("outputs") or {}).get("size_bytes")
+        cmd = r.get("command_str", "")
+        if len(cmd) > 60:
+            cmd = cmd[:57] + "..."
+        print(
+            f"| `{r.get('label','?')}` "
+            f"| {fmt_seconds(r.get('wall_clock_seconds'))} "
+            f"| {fmt_seconds(cpu)} "
+            f"| {r.get('peak_rss_mb','-')} MB "
+            f"| {r.get('exit_code','-')} "
+            f"| {fmt_bytes(out_sz)} "
+            f"| `{cmd}` |"
+        )
+
+    if records:
+        v = records[0].get("versions") or {}
+        used = [(k, val) for k, val in v.items() if val]
+        if used:
+            print("\n## Tool versions\n")
+            for k, val in used:
+                print(f"- **{k}**: {val}")
+
+    if records:
+        h = records[0].get("host") or {}
+        if h:
+            print("\n## Host\n")
+            print(f"- platform: {h.get('platform')}")
+            print(f"- CPU count: {h.get('cpu_count')}")
+            print(f"- Python: {h.get('python_version')}")
+
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="sedna-bench",
+        description="SEDNA benchmark wrapper - records runtime / memory / versions.",
+        usage="sedna-bench [--label LABEL] [--out-dir DIR] -- COMMAND [ARGS...]\n"
+              "       sedna-bench --summary DIR",
+    )
+    parser.add_argument("--label", default=None,
+                        help="Output filename label (default: inferred from command).")
+    parser.add_argument("--out-dir", default="./bench",
+                        help="Directory for JSON records. Default: ./bench")
+    parser.add_argument("--summary", metavar="DIR", default=None,
+                        help="Summary mode: print Markdown table for *.json in DIR.")
+    parser.add_argument("rest", nargs=argparse.REMAINDER,
+                        help="Command to wrap (after '--').")
+
+    args = parser.parse_args()
+
+    if args.summary:
+        return cmd_summary(args.summary)
+
+    rest = list(args.rest)
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+    if not rest:
+        parser.print_help(sys.stderr)
+        return 2
+
+    return cmd_wrap(args.label, args.out_dir, rest)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
